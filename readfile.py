@@ -51,8 +51,7 @@ class ReadFile:
         #  常量初始化
         if ReadFile.NLines == None:
             ReadFile.NLines = self.NLines_
-        # Bug修复4: 原代码将 OLines 的值错误地赋给了 NLines，导致 OLines 类变量永远为 None
-        # Position 类中 self.Lines = ReadFile.OLines 会得到 None，程序直接崩溃
+
         if ReadFile.OLines == None:
             ReadFile.OLines = self.OLines_
         if ReadFile.ApproxPos == [None] * 3:
@@ -87,9 +86,7 @@ class ReadFile:
         # 这个是卫星观测值，用于计算卫星的位置，本项目中是一个6乘4的矩阵
         self.SateliteObservation = []
 
-    # Bug修复5: 以下 getter 方法用 @classmethod 装饰但访问实例变量（如 NHeaderLastLine），
-    # 会导致 AttributeError。访问类变量的方法改为真正的 classmethod（参数改为 cls），
-    # 访问实例变量的方法去掉 @classmethod 改为普通实例方法。
+
     @classmethod
     def GetApproxPos(cls):
         return cls.ApproxPos

@@ -57,8 +57,7 @@ class Satelite:
 
     # 计算卫星位置
     def caculate_pos_of_sat(matrix, a3, obstime, reftime):
-        # Bug修复1: GM 为 WGS-84 标准值 3.986005e14 m³/s²，原代码写成了 e5，差9个数量级
-        # 参考 RTKLIB ephemeris.c: #define MU_GPS 3.9860050E14
+
         GM = 3.986005 * pow(10, 14)
         n0 = np.sqrt(GM) / pow(matrix[1, 3], 3)
         n = n0 + matrix[0, 2]
@@ -72,9 +71,7 @@ class Satelite:
             + a3[1] * (gps_obssec - gps_refseconds)
             + a3[2] * pow(gps_obssec - gps_refseconds, 2)
         )
-        # Bug修复2: 应用卫星钟差改正后得到真实接收时刻，应用观测时刻减去钟差
-        # 原代码错误地用 gps_refseconds（参考时刻）相减，注释已标出正确写法但未修改
-        # 参考 RTKLIB pntpos.c: r+dtr-CLIGHT*dts[i*2]+dion+dtrp
+
         t = gps_obssec - delta_t
         tk = t - matrix[2, 0]
 
@@ -95,9 +92,7 @@ class Satelite:
         sin_Vk = (np.sqrt(1 - matrix[1, 1] * matrix[1, 1]) * np.sin(Ek)) / (
             1 - matrix[1, 1] * np.cos(Ek)
         )
-        # Bug修复3: 原代码用 arctan 只能返回 [-π/2, π/2]，第二/三象限时结果错误
-        # 必须用 arctan2(sin, cos) 才能正确处理所有象限
-        # 参考 RTKLIB ephemeris.c: u=atan2(sqrt(1-e*e)*sinE, cosE-e) + omg
+
         Vk = np.arctan2(sin_Vk, cos_Vk)
 
         phi_k = Vk + matrix[3, 2]
@@ -117,17 +112,11 @@ class Satelite:
         we = 7.29211567 * pow(10, -5)
         omegek = matrix[2, 2] + (matrix[3, 3] - we) * tk - we * matrix[2, 0]
 
-        # Bug修复10: 原代码 sin(ik)/cos(ik) 完全互换，导致卫星坐标误差数千公里
-        # 正确公式参考 RTKLIB ephemeris.c eph2pos():
-        #   rs[0]=x*cosO - y*cos(i)*sinO
-        #   rs[1]=x*sinO + y*cos(i)*cosO
-        #   rs[2]=y*sin(i)
+
         Xk = xk * np.cos(omegek) - yk * np.cos(ik) * np.sin(omegek)
         Yk = xk * np.sin(omegek) + yk * np.cos(ik) * np.cos(omegek)
         Zk = yk * np.sin(ik)
 
-        # Bug修复11: 添加相对论效应钟差改正（约10m量级）
-        # RTKLIB ephemeris.c: *dts -= 2.0*sqrt(mu*eph->A)*eph->e*sinE/SQR(CLIGHT)
         CLIGHT = 299792458.0
         delta_t -= 2.0 * np.sqrt(GM * matrix[1, 3] ** 2) * matrix[1, 1] * np.sin(Ek) / (CLIGHT ** 2)
 

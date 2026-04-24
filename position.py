@@ -272,8 +272,7 @@ class Position:
             obs_time[2] = int((line[7:9]).strip())
             obs_time[3] = int((line[10:12]).strip())
             obs_time[4] = int((line[13:15]).strip())
-            # Bug修复6: RINEX 2.11 秒数为 F10.7 格式，位于 col[15:26]（共11字节）
-            # 原代码 [17:18] 只读了1个字符，导致秒数 >= 10 时解析错误（如 30s 读成 0）
+
             obs_time[5] = float((line[15:26]).strip())
 
             # 这里表示当前观测时间下，有多少个卫星观测值
@@ -336,7 +335,7 @@ class Position:
             # 更新读取的行数
             NReadLine = NReadLine + lps * num_sat
 
-            # Bug修复9: 添加数组越界检查，防止读取到文件末尾时 IndexError
+
             if NReadLine >= len(self.Lines):
                 break
 
@@ -361,8 +360,7 @@ class Position:
             for index1, SatPRN1 in enumerate(self.SateliteName):
                 if SatPRN == SatPRN1:
                     # 计算时间差，取绝对值
-                    # Bug修复8: 原代码未取绝对值，当观测时刻晚于参考时刻时（时间差为负），
-                    # min() 会选出负值最大的（即差最远的星历），而非最近的
+
                     TimeDiff.append(
                         abs(self.CaculateTimeDifference(ObsTime, self.Time[index1]))
                     )
