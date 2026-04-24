@@ -55,7 +55,6 @@ python gui.py
 
 <div align=center><img src="img/GUI1.png" width=100%></div>
 
-
 <div align=center><img src="img/GUI2.png" width=100%></div>
 
 图形界面提供四个标签页：
@@ -99,7 +98,7 @@ python main.py
 
 ### 2.1 Python 版本
 
-Python 3.8 及以上。
+Python 3.10 及以上。
 
 ### 2.2 安装依赖
 
@@ -120,8 +119,17 @@ pip install numpy matplotlib PyQt5
 ### 3.1 克隆项目
 
 ```bash
+conda create -n gnss-spp python=3.13 -y
+conda activate gnss-spp
+pip install numpy matplotlib PyQt5
+  
 git clone https://github.com/luohongk/GNSS-SPP.git
 cd GNSS-SPP
+
+#运行命令行：
+python main.py
+#运行gui
+python gui.py
 ```
 
 ### 3.2 准备数据
