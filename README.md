@@ -53,7 +53,13 @@
 python gui.py
 ```
 
+<div align=center><img src="img/GUI1.png" width=100%></div>
+
+
+<div align=center><img src="img/GUI2.png" width=100%></div>
+
 图形界面提供四个标签页：
+
 - **结果表格**：逐历元展示 ECEF 坐标（X/Y/Z）、迭代次数、有效卫星数
 - **XYZ 时序**：三分量时序折线图，自动标注粗差历元（红叉）
 - **平面散点**：水平偏差散点图，带粗差阈值圆
@@ -77,17 +83,17 @@ python main.py
 
 **核心功能：**
 
-| 模块 | 说明 |
-|------|------|
-| 广播星历解析 | 解析 RINEX 2.11 导航文件，完整实现开普勒轨道根数积分 |
-| 卫星位置计算 | 支持偏近点角迭代、摄动改正、相对论钟差改正 |
-| 电离层改正 | Klobuchar 广播电离层模型（ION ALPHA/BETA 来自导航文件头） |
-| 对流层改正 | 完整 Saastamoinen 模型（干湿分量+高度修正） |
-| 地球自转改正 | Sagnac 效应改正（信号传播期间地球自转） |
-| 加权最小二乘 | 仰角相关权函数，支持迭代收敛（最大 50 次） |
-| 粗差剔除 | 后验残差检验（阈值 30 m）+ GUI 层 10% 百分位剔除 |
-| 仰角截止角 | 命令行 15°，GUI 模式 10° |
-| PyQt5 可视化 | 多标签图形界面，后台线程解算，实时进度条 |
+| 模块         | 说明                                                      |
+| ------------ | --------------------------------------------------------- |
+| 广播星历解析 | 解析 RINEX 2.11 导航文件，完整实现开普勒轨道根数积分      |
+| 卫星位置计算 | 支持偏近点角迭代、摄动改正、相对论钟差改正                |
+| 电离层改正   | Klobuchar 广播电离层模型（ION ALPHA/BETA 来自导航文件头） |
+| 对流层改正   | 完整 Saastamoinen 模型（干湿分量+高度修正）               |
+| 地球自转改正 | Sagnac 效应改正（信号传播期间地球自转）                   |
+| 加权最小二乘 | 仰角相关权函数，支持迭代收敛（最大 50 次）                |
+| 粗差剔除     | 后验残差检验（阈值 30 m）+ GUI 层 10% 百分位剔除          |
+| 仰角截止角   | 命令行 15°，GUI 模式 10°                                |
+| PyQt5 可视化 | 多标签图形界面，后台线程解算，实时进度条                  |
 
 # 2 Dependencies
 
@@ -101,11 +107,11 @@ Python 3.8 及以上。
 pip install numpy matplotlib PyQt5
 ```
 
-| 包名 | 用途 |
-|------|------|
-| `numpy` | 矩阵运算、最小二乘求解 |
+| 包名           | 用途                     |
+| -------------- | ------------------------ |
+| `numpy`      | 矩阵运算、最小二乘求解   |
 | `matplotlib` | 结果可视化（嵌入 PyQt5） |
-| `PyQt5` | 图形界面框架 |
+| `PyQt5`      | 图形界面框架             |
 
 > **注意**：命令行模式（`main.py`）仅需 `numpy`，无需 `matplotlib` 和 `PyQt5`。
 
@@ -114,8 +120,8 @@ pip install numpy matplotlib PyQt5
 ### 3.1 克隆项目
 
 ```bash
-git clone https://github.com/luohongk/PseudorangeSPP.git
-cd PseudorangeSPP
+git clone https://github.com/luohongk/GNSS-SPP.git
+cd GNSS-SPP
 ```
 
 ### 3.2 准备数据
@@ -146,14 +152,14 @@ python gui.py
 
 # 4 File Structure
 
-| 文件名 | 功能 |
-|--------|------|
-| `main.py` | 命令行入口，调用各模块完成完整解算流程 |
+| 文件名          | 功能                                                                   |
+| --------------- | ---------------------------------------------------------------------- |
+| `main.py`     | 命令行入口，调用各模块完成完整解算流程                                 |
 | `readfile.py` | `ReadFile` 类：解析 RINEX O/N 文件，提取观测值、星历参数、电离层系数 |
-| `satelite.py` | `Satelite` 类：基于广播星历计算卫星 ECEF 坐标和钟差 |
-| `position.py` | `Position` 类：逐历元匹配卫星、施加延迟改正、迭代加权最小二乘定位 |
-| `gui.py` | PyQt5 图形界面，多线程解算 + matplotlib 实时绘图 |
-| `data/` | 示例 RINEX 数据（AL2H 测站） |
+| `satelite.py` | `Satelite` 类：基于广播星历计算卫星 ECEF 坐标和钟差                  |
+| `position.py` | `Position` 类：逐历元匹配卫星、施加延迟改正、迭代加权最小二乘定位    |
+| `gui.py`      | PyQt5 图形界面，多线程解算 + matplotlib 实时绘图                       |
+| `data/`       | 示例 RINEX 数据（AL2H 测站）                                           |
 
 # 5 Positioning Principle
 
