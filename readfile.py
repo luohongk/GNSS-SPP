@@ -29,6 +29,10 @@ class ReadFile:
     # O文件观测类型列表，例如 ['L1','L2','P1','P2','C1','C2','S1','S2']
     ObsTypes = []
 
+    # Klobuchar 电离层改正参数（来自 N 文件头 ION ALPHA / ION BETA）
+    IonAlpha = [0.0, 0.0, 0.0, 0.0]
+    IonBeta  = [0.0, 0.0, 0.0, 0.0]
+
     # 类的初始化函数
     def __init__(self, File):
 
@@ -41,7 +45,7 @@ class ReadFile:
         self.ApproxPos = []
         self.ObsTypes = []
         #  O,N文件预处理模块
-        self.NHeaderLastLine = ReadFile.PreprocessNFile(self.NLines_)
+        self.NHeaderLastLine = self.PreprocessNFile(self.NLines_)
         self.OHeaderLastLine = ReadFile.PreprocessOFile(self, self.OLines_)
 
         #  常量初始化
@@ -59,6 +63,12 @@ class ReadFile:
 
         if not ReadFile.ObsTypes:
             ReadFile.ObsTypes = self.ObsTypes
+
+        # 传播 Klobuchar 电离层参数到类变量（仅首次实例化时赋值）
+        if ReadFile.IonAlpha == [0.0, 0.0, 0.0, 0.0]:
+            ReadFile.IonAlpha = self._ion_alpha
+        if ReadFile.IonBeta == [0.0, 0.0, 0.0, 0.0]:
+            ReadFile.IonBeta = self._ion_beta
 
         self.Satelites = []
 
@@ -115,17 +125,43 @@ class ReadFile:
             ReadFile.OLines = lines
             return lines
 
-    def PreprocessNFile(lines):
+    def PreprocessNFile(self, lines):
+        """解析 N 文件头：提取 END OF HEADER 行号和 Klobuchar 电离层参数。"""
+
+        def _parse_rinex_float(s):
+            """将 RINEX/Fortran D-notation 字符串转换为 float，如 '2.9802D-08'。"""
+            return float(s.strip().replace('D', 'E').replace('d', 'e'))
 
         # 寻找END OF HEADER所在的行
         target_string = "END OF HEADER"
         HeadLine = 0
+        ion_alpha = [0.0, 0.0, 0.0, 0.0]
+        ion_beta  = [0.0, 0.0, 0.0, 0.0]
 
         # 遍历行，如果找到了end of header就记录并且退出
         for i, line in enumerate(lines, start=1):
+            if "ION ALPHA" in line:
+                try:
+                    # RINEX 2.11: 4个值，每个12字节，从第2列开始（0-indexed col 2）
+                    for k in range(4):
+                        col = 2 + k * 12
+                        ion_alpha[k] = _parse_rinex_float(line[col:col+12])
+                except Exception:
+                    pass
+            if "ION BETA" in line:
+                try:
+                    for k in range(4):
+                        col = 2 + k * 12
+                        ion_beta[k] = _parse_rinex_float(line[col:col+12])
+                except Exception:
+                    pass
             if target_string in line:
                 HeadLine = i
                 break
+
+        # 将解析结果存入实例属性，供 __init__ 传递到类变量
+        self._ion_alpha = ion_alpha
+        self._ion_beta  = ion_beta
         return HeadLine
         # 此处是拓展部分,由于我已经知道我的文件是GPS数据了,就直接命名卫星名字为GXXX
         # 这里可以自己拓展一下

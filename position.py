@@ -58,40 +58,183 @@ class Position:
     def GenerateObs(self):
         return 0
 
+    # ------------------------------------------------------------------ #
+    #  辅助工具：卫星高度角与方位角
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def calc_elevation_azimuth(rec_xyz, sat_xyz):
+        """
+        计算卫星相对于接收机的高度角和方位角。
+
+        Args:
+            rec_xyz: 接收机 ECEF 坐标 [X, Y, Z]（米）
+            sat_xyz: 卫星   ECEF 坐标 [X, Y, Z]（米）
+
+        Returns:
+            elev_deg: 高度角（度，-90~90）
+            azim_deg: 方位角（度，0~360，北为0顺时针）
+        """
+        dx = sat_xyz[0] - rec_xyz[0]
+        dy = sat_xyz[1] - rec_xyz[1]
+        dz = sat_xyz[2] - rec_xyz[2]
+
+        # 接收机大地纬度 φ 和经度 λ
+        r_xy = np.sqrt(rec_xyz[0]**2 + rec_xyz[1]**2)
+        lat  = np.arctan2(rec_xyz[2], r_xy)   # 地心纬度（近似）
+        lon  = np.arctan2(rec_xyz[1], rec_xyz[0])
+
+        # 旋转矩阵：ECEF → 站心坐标系（ENU）
+        sin_lat, cos_lat = np.sin(lat), np.cos(lat)
+        sin_lon, cos_lon = np.sin(lon), np.cos(lon)
+
+        # ENU = R * d
+        e =  -sin_lon * dx + cos_lon * dy
+        n =  -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz
+        u =   cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz
+
+        hor  = np.sqrt(e**2 + n**2)
+        elev = np.arctan2(u, hor)            # 高度角（rad）
+        azim = np.arctan2(e, n)              # 方位角（rad）
+        if azim < 0:
+            azim += 2 * np.pi
+
+        return np.degrees(elev), np.degrees(azim)
+
+    # ------------------------------------------------------------------ #
+    #  Klobuchar 电离层改正（GPS L1，单位：秒，调用时 ×c 得米）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def klobuchar_iono(rec_xyz, sat_xyz, obs_time, alpha, beta):
+        """
+        Klobuchar 电离层时延改正（ICD-GPS-200，L1 频率）。
+
+        Args:
+            rec_xyz : 接收机 ECEF [X, Y, Z]（米）
+            sat_xyz : 卫星   ECEF [X, Y, Z]（米）
+            obs_time: 观测时刻 [year, mon, day, hour, min, sec]
+            alpha   : 电离层 α 系数列表（4个，来自 N 文件头）
+            beta    : 电离层 β 系数列表（4个，来自 N 文件头）
+
+        Returns:
+            dion_sec: 电离层时延（秒）
+        """
+        elev_deg, azim_deg = Position.calc_elevation_azimuth(rec_xyz, sat_xyz)
+        El    = elev_deg / 180.0          # 高度角（半圆）
+        Az    = np.radians(azim_deg)
+
+        # 接收机大地纬度（半圆）
+        r_xy  = np.sqrt(rec_xyz[0]**2 + rec_xyz[1]**2)
+        lat_r = np.arctan2(rec_xyz[2], r_xy)
+        phi_u = lat_r / np.pi             # 半圆
+
+        # 地心角（半圆）
+        psi = 0.0137 / (El + 0.11) - 0.022
+
+        # 穿刺点纬度（半圆）
+        phi_i = phi_u + psi * np.cos(Az)
+        phi_i = max(-0.416, min(0.416, phi_i))
+
+        # 穿刺点经度（半圆）
+        lon_r = np.arctan2(rec_xyz[1], rec_xyz[0])
+        lam_u = lon_r / np.pi
+        lam_i = lam_u + psi * np.sin(Az) / np.cos(phi_i * np.pi)
+
+        # 地磁纬度（半圆）
+        phi_m = phi_i + 0.064 * np.cos((lam_i - 1.617) * np.pi)
+
+        # 本地时（秒）
+        t_gps  = (obs_time[3] * 3600 + obs_time[4] * 60 + obs_time[5])
+        t_loc  = 43200.0 * lam_i + t_gps
+        t_loc  = t_loc % 86400.0
+
+        # 振幅 AMP 和 周期 PER
+        AMP = sum(alpha[n] * phi_m**n for n in range(4))
+        PER = sum(beta[n]  * phi_m**n for n in range(4))
+        AMP = max(AMP, 0.0)
+        PER = max(PER, 72000.0)
+
+        x = 2.0 * np.pi * (t_loc - 50400.0) / PER
+
+        # 倾斜因子
+        F = 1.0 + 16.0 * (0.53 - El)**3
+
+        if abs(x) < 1.57:
+            dion_sec = F * (5e-9 + AMP * (1.0 - x**2/2.0 + x**4/24.0))
+        else:
+            dion_sec = F * 5e-9
+
+        return dion_sec   # 单位：秒（×c 得米）
+
+    # ------------------------------------------------------------------ #
+    #  Saastamoinen 对流层改正（天顶方向，简化映射函数）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def saastamoinen_tropo(rec_xyz, sat_xyz):
+        """
+        Saastamoinen 对流层天顶延迟 + 1/sin(elev) 映射函数（精度 ~1m）。
+
+        Args:
+            rec_xyz: 接收机 ECEF [X, Y, Z]（米）
+            sat_xyz: 卫星   ECEF [X, Y, Z]（米）
+
+        Returns:
+            dtrop_m: 对流层距离延迟（米）
+        """
+        elev_deg, _ = Position.calc_elevation_azimuth(rec_xyz, sat_xyz)
+        if elev_deg < 2.0:
+            elev_deg = 2.0          # 防止映射函数奇异
+
+        elev = np.radians(elev_deg)
+
+        # 接收机高程（粗略用 |Z| 推算，正式应转到大地坐标）
+        r    = np.sqrt(rec_xyz[0]**2 + rec_xyz[1]**2 + rec_xyz[2]**2)
+        h    = r - 6371000.0        # 近似高程（米）
+        h    = max(h, 0.0)
+
+        # 标准气压 / 温度（海平面修正到站高）
+        P    = 1013.25 * (1.0 - 2.2557e-5 * h)**5.2568   # hPa
+        T    = 288.15  - 6.5e-3 * h                        # K
+        e    = 50.0 * np.exp(-0.0006396 * h)               # hPa 水汽压（RH≈50%）
+
+        # Saastamoinen 天顶延迟（米）
+        Ztrop = 0.002277 / np.sin(elev) * (P + (1255.0/T + 0.05) * e
+                                            - 4.3e-2 / (np.tan(elev)**2))
+        return max(Ztrop, 0.0)
+
     def validate_pseudorange(self, pr, geom_dist, satellite_id=""):
         """
         检验伪距观测值的物理有效性。
-        
+
         伪距方程: PR = ρ + c*dtr - c*dts + delays + noise
         约束条件: 接收机钟差通常在 ±10ms 内，所以:
                 PR 应该接近 ρ，误差在几米到几百米之间
-        
+
         Args:
             pr: 观测伪距 (米)
             geom_dist: 几何距离 (米)
             satellite_id: 卫星标识 (用于日志输出)
-        
+
         Returns:
             (is_valid, message)
         """
         c = 299792458
-        
+
         # 允许的最大钟差 (秒) - 典型值为 ±0.01 秒 = ±10 ms
         max_clock_bias = 0.01
         max_bias_meters = max_clock_bias * c
-        
+
         # 物理约束检验
         # 伪距不应该显著小于几何距离
         if pr < geom_dist - max_bias_meters:
             diff_km = (pr - geom_dist) / 1000
             return False, f"Invalid PR for {satellite_id}: {diff_km:.1f} km < expected, implies unrealistic clock bias"
-        
+
         # 伪距也不应该显著大于几何距离
         # (但这个约束较松，因为阴离子延迟和系统误差会使PR更大)
         if pr > geom_dist + 2 * max_bias_meters:
             diff_km = (pr - geom_dist) / 1000
             return False, f"Suspicious PR for {satellite_id}: {diff_km:.1f} km > expected, excessive clock bias"
-        
+
         return True, "Valid"
 
     def MatchObservationAndCaculate(self):
@@ -184,7 +327,7 @@ class Position:
 
             # 进行非线性最小二乘，平差计算地面坐标
             result = self.SolutionLeastSquares(
-                ObsPseudorange, SatLiteXYZ, CurrentApproxPos
+                ObsPseudorange, SatLiteXYZ, CurrentApproxPos, obs_time
             )
             # 用本历元解更新近似坐标，供下一历元使用
             if isinstance(result, list):
@@ -272,11 +415,24 @@ class Position:
         return seconds
 
     # 最小二乘算法求解（带迭代收敛）
-    def SolutionLeastSquares(self, ObsPseudorange, SatLiteXYZ, ApproxPos):
-        # 判断匹配上的伪距是否多于四个，因为最小二乘至少要四个观测方程，求解地面坐标，求解接收机钟差
-
+    def SolutionLeastSquares(self, ObsPseudorange, SatLiteXYZ, ApproxPos, ObsTime=None):
+        """
+        迭代加权最小二乘定位，包含：
+          1. 高度角截止角滤波（15°）
+          2. Klobuchar 电离层改正
+          3. Saastamoinen 对流层改正
+          4. 地球自转改正（Sagnac）
+          5. 后验残差粗差剔除（阈值 30 m）
+        """
         SizeSatLiteXYZ = len(SatLiteXYZ)
-        c = 299792458  # 光速（精确值 m/s）
+        c   = 299792458          # 光速 m/s
+        we  = 7.2921151467e-5    # 地球自转角速度 rad/s（WGS-84）
+        ELEV_MASK  = 15.0        # 高度角截止角（度）
+        GROSS_THR  = 30.0        # 后验残差粗差阈值（米）
+
+        # 读取 Klobuchar 参数（N 文件头解析结果）
+        alpha = ReadFile.IonAlpha
+        beta  = ReadFile.IonBeta
 
         # 统计有效观测数（已匹配且伪距非零）
         valid_count = sum(
@@ -287,60 +443,104 @@ class Position:
             print("无法进行平差计算（有效卫星数不足4颗）")
             return ApproxPos
 
-        # 迭代最小二乘，最多迭代10次，收敛阈值0.001m
         CurrentPos = list(ApproxPos)
-        dtr = 0.0  # 接收机钟差（单位：秒）
-        for iteration in range(10):
-            B = []
-            L = []
+        dtr = 0.0    # 接收机钟差（秒）
+
+        for iteration in range(50):
+            B, L, residual_idx = [], [], []
 
             for k in range(SizeSatLiteXYZ):
-                # 跳过未匹配的卫星
-                if SatLiteXYZ[k][3] == 0:
-                    continue
-                # 跳过无效伪距（P1和C1均为空）
-                if ObsPseudorange[k] == 0:
+                if SatLiteXYZ[k][3] == 0 or ObsPseudorange[k] == 0:
                     continue
 
-                # 计算当前近似位置到卫星的几何距离
+                # ------ 1. 高度角截止角 --------------------------------
+                elev, _ = Position.calc_elevation_azimuth(
+                    CurrentPos,
+                    [SatLiteXYZ[k][0], SatLiteXYZ[k][1], SatLiteXYZ[k][2]]
+                )
+                if elev < ELEV_MASK:
+                    continue      # 低仰角卫星直接剔除
+
+                # ------ 2. 地球自转改正（Sagnac）-----------------------
+                P0_approx = np.sqrt(
+                    (SatLiteXYZ[k][0] - CurrentPos[0])**2
+                    + (SatLiteXYZ[k][1] - CurrentPos[1])**2
+                    + (SatLiteXYZ[k][2] - CurrentPos[2])**2
+                )
+                tau   = P0_approx / c
+                theta = we * tau
+                cos_t, sin_t = np.cos(theta), np.sin(theta)
+                sat_x =  SatLiteXYZ[k][0] * cos_t + SatLiteXYZ[k][1] * sin_t
+                sat_y = -SatLiteXYZ[k][0] * sin_t + SatLiteXYZ[k][1] * cos_t
+                sat_z =  SatLiteXYZ[k][2]
+
+                # 用改正后卫星坐标计算精确几何距离
                 P0 = np.sqrt(
-                    np.square(SatLiteXYZ[k][0] - CurrentPos[0])
-                    + np.square(SatLiteXYZ[k][1] - CurrentPos[1])
-                    + np.square(SatLiteXYZ[k][2] - CurrentPos[2])
+                    (sat_x - CurrentPos[0])**2
+                    + (sat_y - CurrentPos[1])**2
+                    + (sat_z - CurrentPos[2])**2
                 )
 
-                # 设计矩阵B每一行：方向余弦 + 接收机钟差系数
-                TemB0 = -1 * (SatLiteXYZ[k][0] - CurrentPos[0]) / P0
-                TemB1 = -1 * (SatLiteXYZ[k][1] - CurrentPos[1]) / P0
-                TemB2 = -1 * (SatLiteXYZ[k][2] - CurrentPos[2]) / P0
+                # ------ 3. 电离层改正（Klobuchar）----------------------
+                if ObsTime is not None and any(a != 0.0 for a in alpha):
+                    dion = Position.klobuchar_iono(
+                        CurrentPos, [sat_x, sat_y, sat_z],
+                        ObsTime, alpha, beta
+                    ) * c   # 秒 → 米
+                else:
+                    dion = 0.0
+
+                # ------ 4. 对流层改正（Saastamoinen）-------------------
+                dtrop = Position.saastamoinen_tropo(
+                    CurrentPos, [sat_x, sat_y, sat_z]
+                )
+
+                # ------ 5. 设计矩阵行 & 常数项 -------------------------
+                TemB0 = -(sat_x - CurrentPos[0]) / P0
+                TemB1 = -(sat_y - CurrentPos[1]) / P0
+                TemB2 = -(sat_z - CurrentPos[2]) / P0
                 TemB3 = 1.0
                 B.append([TemB0, TemB1, TemB2, TemB3])
 
-                # 常数项L：观测伪距 − 几何距离 + 卫星钟差改正
-                # 伪距观测方程: P = ρ + c*dtr - c*dts
-                # 改写: P - ρ + c*dts = c*dtr + (ρ真 - ρ近似)的线性化部分
-                TemLRol = ObsPseudorange[k] - P0 + c * SatLiteXYZ[k][4]
-                L.append(TemLRol)
+                # 伪距方程: P = ρ + c*dtr - c*dts + dion + dtrop
+                # 常数项  : l = P - ρ + c*dts - dion - dtrop
+                TemL = ObsPseudorange[k] - P0 + c * SatLiteXYZ[k][4] - dion - dtrop
+                L.append(TemL)
+                residual_idx.append(k)
+
+            if len(B) < 4:
+                print("高度角截止后有效卫星不足4颗，跳过本历元")
+                return ApproxPos
 
             ArrayB = np.array(B)
             ArrayL = np.array(L)
 
-            # 间接平差公式: x = (B^T B)^-1 B^T L
             BtB = np.transpose(ArrayB) @ ArrayB
-            # 检查矩阵条件数，避免病态矩阵
             if np.linalg.matrix_rank(BtB) < 4:
                 print("设计矩阵秩不足，无法求解")
                 return ApproxPos
 
             x = np.linalg.inv(BtB) @ (np.transpose(ArrayB) @ ArrayL)
 
-            # 更新近似坐标
+            # 更新坐标与钟差
             CurrentPos[0] += x[0]
             CurrentPos[1] += x[1]
             CurrentPos[2] += x[2]
             dtr += x[3] / c
 
-            # 收敛判断：坐标改正量小于0.11mm则停止迭代
+            # ------ 6. 后验残差粗差剔除 --------------------------------
+            # 计算各观测值残差 v = B*x - l
+            residuals = ArrayB @ x - ArrayL
+            gross_mask = np.abs(residuals) > GROSS_THR
+            if np.any(gross_mask) and iteration < 10:
+                # 将粗差卫星的伪距清零，下次迭代自动跳过
+                for i, kid in enumerate(residual_idx):
+                    if gross_mask[i]:
+                        ObsPseudorange[kid] = 0
+                # 不计入收敛，继续迭代
+                continue
+
+            # 收敛判断：坐标改正量 < 0.001m
             if np.sqrt(x[0]**2 + x[1]**2 + x[2]**2) < 0.001:
                 break
 
@@ -348,7 +548,6 @@ class Position:
             f"平差后的X坐标: {CurrentPos[0]:.3f}",
             f"平差后的Y坐标: {CurrentPos[1]:.3f}",
             f"平差后的Z坐标: {CurrentPos[2]:.3f}",
-            f"(迭代次数: {iteration+1})",
+            f"(迭代次数: {iteration+1}, 有效卫星: {len(B)}颗)",
         )
-
         return CurrentPos

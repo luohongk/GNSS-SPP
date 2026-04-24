@@ -65,6 +65,8 @@ class SppWorker(QThread):
         super().__init__()
         self.o_file = o_file
         self.n_file = n_file
+        self._ion_alpha = [0.0, 0.0, 0.0, 0.0]
+        self._ion_beta  = [0.0, 0.0, 0.0, 0.0]
 
     def run(self):
         try:
@@ -83,12 +85,18 @@ class SppWorker(QThread):
         ReadFile.OLines       = None
         ReadFile.OHeaderLastLine = 0
         ReadFile.ObsTypes     = []
+        ReadFile.IonAlpha     = [0.0, 0.0, 0.0, 0.0]
+        ReadFile.IonBeta      = [0.0, 0.0, 0.0, 0.0]
 
         from readfile import ReadFile
         from position import Position
 
         rf = ReadFile([self.o_file, self.n_file])
         rf.CaculateSatelites()
+
+        # 保存电离层参数供 _least_squares 使用
+        self._ion_alpha = ReadFile.IonAlpha
+        self._ion_beta  = ReadFile.IonBeta
 
         pos = Position(
             rf.SateliteObservation,
@@ -159,7 +167,7 @@ class SppWorker(QThread):
 
             sat_xyz = pos.MatchToSatlite(ot, obs_prn)
 
-            result, iters, valid = self._least_squares(pseudo, sat_xyz, CurrentPos)
+            result, iters, valid = self._least_squares(pseudo, sat_xyz, CurrentPos, ot)
 
             NReadLine += lps * num_sat
 
@@ -180,37 +188,204 @@ class SppWorker(QThread):
             if NReadLine >= len(lines): break
             line = lines[NReadLine]
 
-    # ── 迭代最小二乘（返回 (pos_list, iters, valid_count) 或 None）──
-    def _least_squares(self, pseudo, sat_xyz, approx):
-        c   = 299792458  # Bug修复12: 原值 3.0e8 近似误差约0.07%，改用精确光速值
-        N   = len(sat_xyz)
-        valid = sum(1 for k in range(N) if sat_xyz[k][3]==1 and pseudo[k]!=0)
-        if valid < 4:
-            return None, 0, valid
+    # ── 辅助：ECEF → 卫星仰角和方位角（弧度）──────────────────────────────────────
+    def _ecef2azel(self, rx, ry, rz, sx, sy, sz):
+        """
+        计算卫星相对于接收机的仰角（el）和方位角（az），单位：弧度。
+        使用 WGS-84 椭球参数迭代求大地纬度。
+        az: 从北顺时针 [0, 2π)。el: 从地平面向上 [-π/2, π/2]。
+        """
+        a  = 6378137.0
+        e2 = 6.6943799901414e-3
+        p  = math.sqrt(rx*rx + ry*ry)
+        lon = math.atan2(ry, rx)
+        lat = math.atan2(rz, p * (1.0 - e2))
+        for _ in range(10):
+            N_val = a / math.sqrt(1.0 - e2 * math.sin(lat)**2)
+            lat_new = math.atan2(rz + e2 * N_val * math.sin(lat), p)
+            if abs(lat_new - lat) < 1e-12:
+                break
+            lat = lat_new
+        sl = math.sin(lat); cl = math.cos(lat)
+        so = math.sin(lon); co = math.cos(lon)
+        dx = sx - rx; dy = sy - ry; dz = sz - rz
+        r  = math.sqrt(dx*dx + dy*dy + dz*dz)
+        if r == 0:
+            return 0.0, 0.0
+        # ENU 转换矩阵: E=(-sinlon, coslon, 0), N=(-sinlat*coslon, -sinlat*sinlon, coslat), U=(coslat*coslon, coslat*sinlon, sinlat)
+        e_comp =  -so*dx + co*dy
+        n_comp =  -sl*co*dx - sl*so*dy + cl*dz
+        u_comp =   cl*co*dx + cl*so*dy + sl*dz
+        el = math.asin(max(-1.0, min(1.0, u_comp / r)))
+        az = math.atan2(e_comp, n_comp)
+        if az < 0:
+            az += 2 * math.pi
+        return el, az
 
-        cur  = list(approx)
+    # ── 辅助：对流层延迟改正（完整 Saastamoinen 模型，含干湿分量，参考 RTKLIB tropmodel()）──
+    def _trop_delay(self, el_rad, height_m, lat_rad):
+        """
+        完整 Saastamoinen 模型（标准大气+高度修正+湿分量）。
+        参数:
+            el_rad: 卫星仰角（弧度）
+            height_m: 接收机大地高（米），近似取 ECEF 模长 - 地球半径
+            lat_rad: 接收机大地纬度（弧度）
+        返回: 斜路径对流层延迟（米）
+        """
+        if el_rad < math.radians(2.0):
+            el_rad = math.radians(2.0)
+        hgt   = max(0.0, height_m)
+        pres  = 1013.25 * pow(1.0 - 2.2557e-5 * hgt, 5.2568)
+        temp0 = 15.0  # 地面温度 (°C)
+        temp  = temp0 - 6.5e-3 * hgt + 273.16   # 开尔文
+        humi  = 0.7
+        e     = 6.108 * humi * math.exp((17.15 * temp - 4684.0) / (temp - 38.45))
+        z     = math.pi / 2.0 - el_rad
+        # 干分量（含纬度和高度修正）
+        trph  = 0.0022768 * pres / (1.0 - 0.00266 * math.cos(2.0 * lat_rad) - 0.00028 * hgt / 1e3) / math.cos(z)
+        # 湿分量
+        trpw  = 0.002277 * (1255.0 / temp + 0.05) * e / math.cos(z)
+        return trph + trpw
+
+    # ── 辅助：Klobuchar 电离层改正（参考 RTKLIB rtkcmn.c ionmodel()）──────────
+    def _iono_delay(self, el_rad, az_rad, lat_rad, lon_rad, gps_sec, ion_alpha, ion_beta):
+        """
+        Klobuchar 广播电离层模型，返回 L1 伪距电离层延迟（米）。
+        参数:
+            el_rad, az_rad: 卫星仰角、方位角（弧度）
+            lat_rad, lon_rad: 接收机大地纬度、经度（弧度）
+            gps_sec: GPS 周内秒（秒）
+            ion_alpha[0..3], ion_beta[0..3]: 导航文件 ION ALPHA/BETA 参数
+        """
+        PI = math.pi
+        if el_rad < 0:
+            el_rad = 0.0
+        # 地心角 (半圆)
+        psi = 0.0137 / (el_rad / PI + 0.11) - 0.022
+        # 穿透点大地纬度 (半圆)
+        phi = lat_rad / PI + psi * math.cos(az_rad)
+        if   phi >  0.416: phi =  0.416
+        elif phi < -0.416: phi = -0.416
+        # 穿透点大地经度 (半圆)
+        lam = lon_rad / PI + psi * math.sin(az_rad) / math.cos(phi * PI)
+        # 地磁纬度 (半圆)
+        phi += 0.064 * math.cos((lam - 1.617) * PI)
+        # 当地时间 (秒)
+        tt = 43200.0 * lam + gps_sec
+        tt -= math.floor(tt / 86400.0) * 86400.0
+        # 倾斜因子
+        f = 1.0 + 16.0 * pow(0.53 - el_rad / PI, 3.0)
+        # 幅度和周期
+        amp = ion_alpha[0] + phi * (ion_alpha[1] + phi * (ion_alpha[2] + phi * ion_alpha[3]))
+        per = ion_beta[0]  + phi * (ion_beta[1]  + phi * (ion_beta[2]  + phi * ion_beta[3]))
+        amp = max(0.0, amp)
+        per = max(72000.0, per)
+        x = 2.0 * PI * (tt - 50400.0) / per
+        CLIGHT = 299792458.0
+        if abs(x) < 1.57:
+            iono_t = CLIGHT * f * (5e-9 + amp * (1.0 + x*x * (-0.5 + x*x / 24.0)))
+        else:
+            iono_t = CLIGHT * f * 5e-9
+        return iono_t
+
+    # ── 迭代加权最小二乘（Sagnac + 仰角截止 + 对流层 + 电离层 + 仰角加权）──────────
+    def _least_squares(self, pseudo, sat_xyz, approx, obs_time=None):
+        c        = 299792458          # 精确光速 m/s
+        we       = 7.2921151467e-5    # WGS-84 地球自转角速度 rad/s
+        EL_CUT   = math.radians(10)   # 仰角截止角 10°
+        N        = len(sat_xyz)
+
+        # 粗计有效观测数（未过截止角前）
+        valid_raw = sum(1 for k in range(N) if sat_xyz[k][3]==1 and pseudo[k]!=0)
+        if valid_raw < 4:
+            return None, 0, valid_raw
+
+        # 计算 GPS 周内秒（供 Klobuchar 模型使用）
+        gps_sec = 0.0
+        if obs_time is not None:
+            import datetime
+            gps_epoch = datetime.datetime(1980, 1, 6, 0, 0, 0)
+            t_obs = datetime.datetime(obs_time[0], obs_time[1], obs_time[2],
+                                      obs_time[3], obs_time[4], int(obs_time[5]))
+            total_s = (t_obs - gps_epoch).total_seconds()
+            _, gps_sec = divmod(total_s, 604800.0)
+
+        # 接收机大地坐标（用于 trop/iono 模型），在迭代前计算一次足够
+        a_wgs = 6378137.0
+        e2    = 6.6943799901414e-3
+
+        cur   = list(approx)
         iters = 0
-        for iters in range(10):
-            B, L = [], []
+        for iters in range(50):
+            # 接收机大地纬度、经度、高度（每次迭代用更新后的 cur）
+            rx, ry, rz = cur[0], cur[1], cur[2]
+            p_r  = math.sqrt(rx*rx + ry*ry)
+            lon_r = math.atan2(ry, rx)
+            lat_r = math.atan2(rz, p_r * (1.0 - e2))
+            for _ in range(10):
+                N_r = a_wgs / math.sqrt(1.0 - e2 * math.sin(lat_r)**2)
+                lat_new = math.atan2(rz + e2 * N_r * math.sin(lat_r), p_r)
+                if abs(lat_new - lat_r) < 1e-12: break
+                lat_r = lat_new
+            N_r = a_wgs / math.sqrt(1.0 - e2 * math.sin(lat_r)**2)
+            h_r = p_r / math.cos(lat_r) - N_r  # 大地高（米）
+
+            B, L, W = [], [], []
             for k in range(N):
                 if sat_xyz[k][3] == 0 or pseudo[k] == 0:
                     continue
-                dx = sat_xyz[k][0]-cur[0]
-                dy = sat_xyz[k][1]-cur[1]
-                dz = sat_xyz[k][2]-cur[2]
-                P0 = math.sqrt(dx*dx + dy*dy + dz*dz)
-                B.append([-dx/P0, -dy/P0, -dz/P0, 1.0])
-                L.append(pseudo[k] - P0 + c*sat_xyz[k][4])
+                sx, sy, sz = sat_xyz[k][0], sat_xyz[k][1], sat_xyz[k][2]
 
-            AB = np.array(B); AL = np.array(L)
-            BtB = AB.T @ AB
-            if np.linalg.matrix_rank(BtB) < 4:
-                return None, iters+1, valid
-            x = np.linalg.inv(BtB) @ (AB.T @ AL)
+                # ── 1. 初步几何距离（用于计算信号传播时间）──────────────
+                dx = sx - cur[0]; dy = sy - cur[1]; dz = sz - cur[2]
+                P0 = math.sqrt(dx*dx + dy*dy + dz*dz)
+
+                # ── 2. Sagnac 效应（地球自转改正）────────────────────────
+                tau    = P0 / c
+                cos_wt = math.cos(we * tau)
+                sin_wt = math.sin(we * tau)
+                sx_r   =  sx * cos_wt + sy * sin_wt
+                sy_r   = -sx * sin_wt + sy * cos_wt
+                sz_r   =  sz
+                dx = sx_r - cur[0]; dy = sy_r - cur[1]; dz = sz_r - cur[2]
+                P0 = math.sqrt(dx*dx + dy*dy + dz*dz)
+
+                # ── 3. 仰角/方位角计算与截止角筛选 ──────────────────────────────
+                el, az = self._ecef2azel(cur[0], cur[1], cur[2], sx_r, sy_r, sz_r)
+                if el < EL_CUT:
+                    continue
+
+                # ── 4. 对流层延迟改正（完整 Saastamoinen）─────────────────────
+                trop = self._trop_delay(el, h_r, lat_r)
+
+                # ── 5. 电离层延迟改正（Klobuchar）─────────────────────────────
+                iono = self._iono_delay(el, az, lat_r, lon_r, gps_sec,
+                                        self._ion_alpha, self._ion_beta)
+
+                # ── 6. 设计矩阵行（方向余弦 + 钟差系数）──────────────────
+                B.append([-dx/P0, -dy/P0, -dz/P0, 1.0])
+
+                # ── 7. 观测残差：P = ρ + c·dtr − c·dts + dion + dtrop
+                #       → L = P − ρ + c·dts − dion − dtrop
+                L.append(pseudo[k] - P0 + c * sat_xyz[k][4] - trop - iono)
+
+                # ── 8. 仰角相关权重（参考 RTKLIB pntpos.c varerr()）────────
+                sigma = 0.003 + 0.003 / math.sin(el)
+                W.append(1.0 / (sigma * sigma))
+
+            valid_used = len(B)
+            if valid_used < 4:
+                return None, iters+1, valid_raw
+
+            AB = np.array(B); AL = np.array(L); AW = np.diag(W)
+            BtWB = AB.T @ AW @ AB
+            if np.linalg.matrix_rank(BtWB) < 4:
+                return None, iters+1, valid_raw
+            x = np.linalg.inv(BtWB) @ (AB.T @ AW @ AL)
             cur[0] += x[0]; cur[1] += x[1]; cur[2] += x[2]
             if math.sqrt(x[0]**2+x[1]**2+x[2]**2) < 0.001:
                 break
-        return cur, iters+1, valid
+        return cur, iters+1, valid_used
 
 
 # ──────────────────────────────────────────────
@@ -553,12 +728,16 @@ class MainWindow(QMainWindow):
         ys_all = np.array([r["y"] for r in self.results])
         zs_all = np.array([r["z"] for r in self.results])
 
-        # ── 粗差剔除：以全部历元的中值为参考，|ΔX|>10m 或 |ΔY|>10m 则剔除 ──
-        THRESHOLD = 10.0          # 单位：米
+        # ── 粗差剔除：计算每历元到坐标中值的 3D 距离，剔除最差的 10% ──
+        OUTLIER_PCT = 10.0       # 剔除比例（%）
         ref_x = np.median(xs_all)
         ref_y = np.median(ys_all)
-        mask_good = (np.abs(xs_all - ref_x) <= THRESHOLD) & \
-                    (np.abs(ys_all - ref_y) <= THRESHOLD)
+        ref_z = np.median(zs_all)
+        err3d_all = np.sqrt((xs_all - ref_x)**2 +
+                            (ys_all - ref_y)**2 +
+                            (zs_all - ref_z)**2)
+        THRESHOLD = np.percentile(err3d_all, 100.0 - OUTLIER_PCT)
+        mask_good = err3d_all <= THRESHOLD
         mask_bad  = ~mask_good
 
         xs = xs_all[mask_good]
@@ -621,16 +800,16 @@ class MainWindow(QMainWindow):
                                   label=f"粗差 ({n_bad})")
         self._ax_scat.axhline(0, color="gray", linewidth=0.8)
         self._ax_scat.axvline(0, color="gray", linewidth=0.8)
-        # 绘制10m剔除阈值框（以好点均值为中心）
-        from matplotlib.patches import Rectangle
-        rect = Rectangle((-THRESHOLD, -THRESHOLD), 2*THRESHOLD, 2*THRESHOLD,
-                         linewidth=1.2, edgecolor="#FF6F00", facecolor="none",
-                         linestyle="--", label=f"±{THRESHOLD:.0f} m 阈值")
-        self._ax_scat.add_patch(rect)
+        # 绘制剔除阈值圆（以中值为中心，半径 = 90th 百分位 3D 误差）
+        from matplotlib.patches import Circle
+        circ = Circle((0, 0), THRESHOLD,
+                      linewidth=1.2, edgecolor="#FF6F00", facecolor="none",
+                      linestyle="--", label=f"阈值 {THRESHOLD:.1f} m (90%)")
+        self._ax_scat.add_patch(circ)
         self._ax_scat.set_xlabel("ΔX (m)  东西方向")
         self._ax_scat.set_ylabel("ΔY (m)  南北方向")
         self._ax_scat.set_title(
-            f"水平分量散点图（相对坐标均值，±{THRESHOLD:.0f} m 阈值剔除粗差）"
+            f"水平分量散点图（相对坐标中值，剔除 3D 误差最大的 {OUTLIER_PCT:.0f}%）"
         )
         self._ax_scat.set_aspect("equal", "datalim")
         self._ax_scat.grid(True, alpha=0.3)
@@ -661,7 +840,7 @@ class MainWindow(QMainWindow):
 
         self._log(
             f"粗差剔除完成：共 {len(xs_all)} 历元，"
-            f"剔除 {n_bad} 个（|ΔX|>{THRESHOLD:.0f}m 或 |ΔY|>{THRESHOLD:.0f}m），"
+            f"剔除 3D 误差最大的 {OUTLIER_PCT:.0f}%（{n_bad} 个，阈值 {THRESHOLD:.2f} m），"
             f"保留 {n_good} 个。"
         )
 
@@ -672,12 +851,16 @@ class MainWindow(QMainWindow):
         ys_all = np.array([r["y"] for r in self.results])
         zs_all = np.array([r["z"] for r in self.results])
 
-        # 与 _update_plots 保持一致的剔除逻辑
-        THRESHOLD = 10.0
+        # 与 _update_plots 保持一致的剔除逻辑：剔除 3D 误差最大的 10%
+        OUTLIER_PCT = 10.0
         ref_x = np.median(xs_all)
         ref_y = np.median(ys_all)
-        mask_good = (np.abs(xs_all - ref_x) <= THRESHOLD) & \
-                    (np.abs(ys_all - ref_y) <= THRESHOLD)
+        ref_z = np.median(zs_all)
+        err3d_all = np.sqrt((xs_all - ref_x)**2 +
+                            (ys_all - ref_y)**2 +
+                            (zs_all - ref_z)**2)
+        THRESHOLD = np.percentile(err3d_all, 100.0 - OUTLIER_PCT)
+        mask_good = err3d_all <= THRESHOLD
         xs = xs_all[mask_good]
         ys = ys_all[mask_good]
         zs = zs_all[mask_good]
